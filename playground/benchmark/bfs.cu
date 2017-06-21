@@ -53,8 +53,8 @@ int main( int argc, char** argv)
 {
     char* bitcode = &_binary_kernel_bc_start;
     size_t len = ((size_t)&_binary_kernel_bc_end)-((size_t)&_binary_kernel_bc_start);
-    Kernel_kf = new KernelFunction(bitcode, len, "Kernel");
-    Kernel2_kf = new KernelFunction(bitcode, len, "Kernel2");
+    Kernel_kf = new KernelFunction(bitcode, len, "_Z6KernelP4NodePiPbS2_S2_S1_i");
+    Kernel2_kf = new KernelFunction(bitcode, len, "_Z7Kernel2PbS_S_S_i");
 
 	no_of_nodes=0;
 	edge_list_size=0;
@@ -199,11 +199,15 @@ void BFSGraph( int argc, char** argv)
 		//if no thread changes this value then the loop stops
 		stop=false;
 		cudaMemcpy( d_over, &stop, sizeof(bool), cudaMemcpyHostToDevice) ;
-		Kernel<<< grid, threads, 0 >>>( d_graph_nodes, d_graph_edges, d_graph_mask, d_updating_graph_mask, d_graph_visited, d_cost, no_of_nodes);
+		//Kernel<<< grid, threads, 0 >>>( d_graph_nodes, d_graph_edges, d_graph_mask, d_updating_graph_mask, d_graph_visited, d_cost, no_of_nodes);
+        void* k1_params[] = {&d_graph_nodes, &d_graph_edges, &d_graph_mask, &d_updating_graph_mask, &d_graph_visited, &d_cost, &no_of_nodes};
+        Kernel_kf->launchKernel(num_of_blocks, 1, 1, num_of_threads_per_block, 1, 1, 0, 0, k1_params);
 		// check if kernel execution generated and error
 
 
-		Kernel2<<< grid, threads, 0 >>>( d_graph_mask, d_updating_graph_mask, d_graph_visited, d_over, no_of_nodes);
+		//Kernel2<<< grid, threads, 0 >>>( d_graph_mask, d_updating_graph_mask, d_graph_visited, d_over, no_of_nodes);
+        void* k2_params[] = {&d_graph_mask, &d_updating_graph_mask, &d_graph_visited, &d_over, &no_of_nodes};
+        Kernel2_kf->launchKernel(num_of_blocks, 1, 1, num_of_threads_per_block, 1, 1, 0, 0, k2_params);
 		// check if kernel execution generated and error
 
 
