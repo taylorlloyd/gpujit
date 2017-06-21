@@ -2,38 +2,31 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <iostream>
-
-#include <llvm/IR/Module.h>
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/raw_ostream.h>
-
-using namespace llvm;
+#include "KernelFunction.h"
 
 // These will be injected by objcopy
 extern char _binary_kernel_bc_start;
 extern char _binary_kernel_bc_end;
 
 int main() {
-    printf("Start: %lX, size: %ld bytes\n",(size_t) &_binary_kernel_bc_start, ((size_t)&_binary_kernel_bc_start)-((size_t)&_binary_kernel_bc_end));
+    printf("Start: %lX, size: %ld bytes\n",(size_t) &_binary_kernel_bc_start, ((size_t)&_binary_kernel_bc_end)-((size_t)&_binary_kernel_bc_start));
 
     char* bitcode = &_binary_kernel_bc_start;
     size_t len = ((size_t)&_binary_kernel_bc_end)-((size_t)&_binary_kernel_bc_start);
 
-    LLVMContext context;
-    SMDiagnostic error;
-    auto ir_buffer = MemoryBuffer::getMemBuffer(StringRef(bitcode, len), "<internal>", false);
-    auto module = parseIR(MemoryBufferRef(*ir_buffer), error, context);
+    KernelFunction kernel(bitcode, len);
 
-    if(!module)
-    {
-        std::string what;
-        llvm::raw_string_ostream os(what);
-        error.print("error after ParseIR()", os);
-        std::cerr << what;
+    CUfunction f = kernel.getCUFunction();
+
+    int x = 4;
+    void* params[] = {&x};
+    CUresult err = cuLaunchKernel(f,1,1,1,1,1,1,0,0, params, NULL);
+    if(err != CUDA_SUCCESS) {
+        return 1;
     }
-    errs() << *module;
+    err = cuStreamSynchronize(0);
+    if(err != CUDA_SUCCESS) {
+        return 2;
+    }
     return 0;
 }
