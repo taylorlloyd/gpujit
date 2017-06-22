@@ -3,7 +3,13 @@
 #include "llvm/IR/Module.h"
 
 #include <cuda.h>
+#include <nvToolsExt.h>
 #include <string>
+#include <vector>
+#include <map>
+
+#include "Assumption.h"
+
 
 class KernelFunction {
   private:
@@ -12,16 +18,15 @@ class KernelFunction {
     static llvm::PassRegistry* Registry;
     static llvm::LLVMContext Context;
     std::unique_ptr<llvm::Module> module;
-    CUmodule* cumodule = nullptr;
-    std::string* ptx = nullptr;
     std::string fnName;
+    AssumptionList allAssumptions;
+    CUModuleMap cumodules;
+
   public:
     KernelFunction(void* bitcode, size_t len);
     KernelFunction(void* bitcode, size_t len, std::string fnName);
     const llvm::Module& getModule();
-    const std::string& getPTX();
-    const CUmodule& getCUModule();
-    CUfunction getCUFunction();
+    CUfunction getCUFunction(const CUmodule&);
     CUresult launchKernel(int gridX, int gridY, int gridZ,
                           int blockX, int blockY, int blockZ,
                           int smem, CUstream stream, void** params);
@@ -29,9 +34,11 @@ class KernelFunction {
     ~KernelFunction();
 
   private:
-    std::string* moduleToPTX(llvm::Module &M);
-    CUmodule loadCUmodule(const std::string& ptx);
-
-    void LLVMInit();
-    void CUDAInit();
+    static std::string* moduleToPTX(llvm::Module &M);
+    static CUmodule loadCUmodule(const std::string& ptx);
+    static CUmodule compileModule(const AssumptionList&, const llvm::Module*);
+    static void LLVMInit();
+    static void CUDAInit();
+    static void *compileModuleAsync_thread(void *);
+    void compileModuleAsync(const AssumptionList&, const llvm::Module*);
 };

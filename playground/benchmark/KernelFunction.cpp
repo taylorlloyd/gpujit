@@ -21,13 +21,19 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "KernelFunction.h"
 
 #include <iostream>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
 
 using namespace llvm;
 
 void KernelFunction::CUDAInit() {
+    nvtxRangePush("CUDAInit");
     cuInit(0);
     int devices;
     CUresult err = cuDeviceGetCount(&devices);
@@ -49,9 +55,11 @@ void KernelFunction::CUDAInit() {
       errs() << "Error setting CUDA context for thread\n";
     }
     doneCUDAInit = true;
+    nvtxRangePop();
 }
 
 void KernelFunction::LLVMInit() {
+  nvtxRangePush("LLVMInit");
   InitializeAllTargets();
   InitializeAllTargetMCs();
   InitializeAllAsmPrinters();
@@ -71,6 +79,7 @@ void KernelFunction::LLVMInit() {
   initializeExpandReductionsPass(*Registry);
   initializeScavengerTestPass(*Registry);
   doneLLVMInit = true;
+  nvtxRangePop();
 }
 
 std::string* KernelFunction::moduleToPTX(Module &M) {
@@ -139,12 +148,6 @@ const Module& KernelFunction::getModule() {
     assert(module != nullptr);
     return *module;
 }
-const std::string& KernelFunction::getPTX() {
-    if(ptx == nullptr)
-        ptx = moduleToPTX((llvm::Module&) getModule());
-    assert(ptx != nullptr);
-    return *ptx;
-}
 
 KernelFunction::KernelFunction(void *bitcode, size_t len) {
     auto ir_buffer = MemoryBuffer::getMemBuffer(StringRef((char*)bitcode, len), "<internal>", false);
@@ -197,24 +200,9 @@ std::string KernelFunction::getKernelName() {
     return "";
 }
 
-KernelFunction::~KernelFunction() {
-    if(cumodule != nullptr)
-        delete cumodule;
-    if(ptx != nullptr)
-        delete ptx;
-}
-
-const CUmodule& KernelFunction::getCUModule() {
-    if(!cumodule) {
-        cumodule = new CUmodule;
-        *cumodule = loadCUmodule(getPTX());
-    }
-    return *cumodule;
-}
-
-CUfunction KernelFunction::getCUFunction() {
+CUfunction KernelFunction::getCUFunction(const CUmodule& M) {
     CUfunction func;
-    CUresult err = cuModuleGetFunction(&func, getCUModule(), getKernelName().c_str());
+    CUresult err = cuModuleGetFunction(&func, M, getKernelName().c_str());
     if(err != CUDA_SUCCESS) {
         errs() << "Error loading function from CUmodule\n";
     }
@@ -235,7 +223,90 @@ CUresult KernelFunction::launchKernel(
                       int gridX, int gridY, int gridZ,
                       int blockX, int blockY, int blockZ,
                       int smem, CUstream stream, void** params) {
-    return cuLaunchKernel(getCUFunction(), gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, NULL);
+    CUmodule mod;
+    CUmodule* M = nullptr;
+    for(auto t=cumodules.begin(),e=cumodules.end(); t!=e; ++t) {
+      bool valid = true;
+      for(auto a=t->first.begin(),e=t->first.end(); a!=e; ++a) {
+        if(!a->holds(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params)) {
+          valid = false;
+          break;
+        }
+      }
+      if(valid) {
+        M = &(t->second);
+        break;
+      }
+    }
+    if(M == nullptr) {
+        // Generate the default module synchronously
+        AssumptionList assumptions;
+        mod = compileModule(assumptions, &getModule());
+        cumodules.insert(make_pair(assumptions, mod));
+        M = &mod;
+    }
+
+    return cuLaunchKernel(getCUFunction(*M), gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, NULL);
+}
+
+CUmodule KernelFunction::compileModule(const AssumptionList& assumptions, const llvm::Module* orig_module) {
+    nvtxRangePush("compileModule");
+    // Make our own copy of the module
+    std::unique_ptr<llvm::Module> M = CloneModule(orig_module);
+
+    // Apply any assumptions
+    nvtxRangePush("JIT Optimizations");
+    for(auto a=assumptions.begin(),e=assumptions.end(); a!=e; ++a) {
+        a->apply(&*M);
+    }
+    nvtxRangePop();
+
+    // Run compilation flow
+    nvtxRangePush("LLVM to PTX");
+    std::string* ptx = moduleToPTX(*M);
+    nvtxRangePop();
+    assert(ptx != nullptr);
+    nvtxRangePush("PTX to SASS");
+    CUmodule cumod = loadCUmodule(*ptx);
+    nvtxRangePop();
+    delete ptx;
+    nvtxRangePop();
+    return cumod;
+}
+
+struct compileModule_args {
+    AssumptionList assumptions;
+    const llvm::Module* module;
+    CUModuleMap* cumodules;
+    CUcontext ctx;
+};
+
+void *KernelFunction::compileModuleAsync_thread(void *v_args) {
+    // Thread init stuff
+    pid_t tid = syscall(SYS_gettid);
+    nvtxNameOsThread(tid, "BackgroundCompile");
+
+    // Extract our arguments
+    struct compileModule_args* args = (struct compileModule_args*) v_args;
+    cuCtxPushCurrent(args->ctx);
+    // Perform the compilation
+    CUmodule cumodule = compileModule(args->assumptions, args->module);
+    // Save the result
+    args->cumodules->insert(make_pair(args->assumptions, cumodule));
+    // We're done with the arguments
+    free(v_args);
+    return nullptr;
+}
+
+void KernelFunction::compileModuleAsync(const AssumptionList& assumptions, const llvm::Module* orig_module) {
+    // Create the arguments
+    struct compileModule_args* args = (struct compileModule_args*) malloc(sizeof(struct compileModule_args));
+    args->assumptions = assumptions;
+    args->module = orig_module;
+    args->cumodules = &cumodules;
+    cuCtxGetCurrent(&args->ctx);
+    pthread_t bg_thread;
+    pthread_create(&bg_thread, NULL, KernelFunction::compileModuleAsync_thread, args);
 }
 
 bool KernelFunction::doneLLVMInit = false;
