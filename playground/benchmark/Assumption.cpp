@@ -4,9 +4,28 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
+using namespace llvm;
 /***************************************
  * Assumption
  **************************************/
+
+void Assumption::update_assumption(int gridX, int gridY, int gridZ, int blockX, int blockY, int blockZ, int smem, void** params) {
+    bool dispatch = holds(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params);
+    held = held << 1 | (dispatch ? 1 : 0);
+    errs() << "Assumption likelihood: (" << held << ") " << willHold() << "\n";
+}
+
+Assumption::Prediction Assumption::willHold() const {
+    // Standard 2-bit saturating counter, with 3-bit VLikely
+    if((held & 0x03) == 0)
+        return Prediction::Unlikely;
+    else if((held & 0x07) == 7)
+        return Prediction::VeryLikely;
+    else if((held & 0x03) == 3)
+        return Prediction::Likely;
+    else
+        return Prediction::Unknown;
+}
 
 bool Assumption::holds(int gridX, int gridY, int gridZ, int blockX, int blockY, int blockZ, int smem, void** params) const {
     return true;
@@ -14,10 +33,17 @@ bool Assumption::holds(int gridX, int gridY, int gridZ, int blockX, int blockY, 
 bool Assumption::apply(llvm::Module* M) const {
     return true;
 }
+bool Assumption::operator==(const Assumption& other) const {
+    return equals(other);
+}
+bool Assumption::equals(const Assumption& other) const {
+    return false;
+}
 
 /***************************************
  * GeometryAssumption
  **************************************/
+
 std::string GeometryAssumption::intrinsic_names[] = {
   "llvm.nvvm.read.ptx.sreg.nctaid.x",
   "llvm.nvvm.read.ptx.sreg.nctaid.y",
@@ -53,5 +79,12 @@ bool GeometryAssumption::apply(llvm::Module* M) const {
       }
     }
     return true;
+}
+
+bool GeometryAssumption::equals(const Assumption& a) const {
+    if(auto ga = dyn_cast<GeometryAssumption>(&a)) {
+        return ga->dim == dim && ga->value == value;
+    }
+    return false;
 }
 

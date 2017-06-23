@@ -228,7 +228,7 @@ CUresult KernelFunction::launchKernel(
     for(auto t=cumodules.begin(),e=cumodules.end(); t!=e; ++t) {
       bool valid = true;
       for(auto a=t->first.begin(),e=t->first.end(); a!=e; ++a) {
-        if(!a->holds(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params)) {
+        if(!(*a)->holds(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params)) {
           valid = false;
           break;
         }
@@ -245,11 +245,20 @@ CUresult KernelFunction::launchKernel(
         cumodules.insert(make_pair(assumptions, mod));
         M = &mod;
     }
+    // Propose Assumptions
+    proposeAssumptions(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params);
+    // Update Assumptions
+    for(auto a=allAssumptions.begin(),e=allAssumptions.end(); a!=e; ++a) {
+        (*a)->update_assumption(gridX, gridY, gridZ, blockX, blockY, blockZ, smem, params);
+    }
+    // Trigger possible recompilation
+    compileLikelyModule();
 
     return cuLaunchKernel(getCUFunction(*M), gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, NULL);
 }
 
 CUmodule KernelFunction::compileModule(const AssumptionList& assumptions, const llvm::Module* orig_module) {
+    compiling = true;
     nvtxRangePush("compileModule");
     // Make our own copy of the module
     std::unique_ptr<llvm::Module> M = CloneModule(orig_module);
@@ -257,7 +266,7 @@ CUmodule KernelFunction::compileModule(const AssumptionList& assumptions, const 
     // Apply any assumptions
     nvtxRangePush("JIT Optimizations");
     for(auto a=assumptions.begin(),e=assumptions.end(); a!=e; ++a) {
-        a->apply(&*M);
+        (*a)->apply(&*M);
     }
     nvtxRangePop();
 
@@ -271,6 +280,7 @@ CUmodule KernelFunction::compileModule(const AssumptionList& assumptions, const 
     nvtxRangePop();
     delete ptx;
     nvtxRangePop();
+    compiling = false;
     return cumod;
 }
 
@@ -285,6 +295,7 @@ void *KernelFunction::compileModuleAsync_thread(void *v_args) {
     // Thread init stuff
     pid_t tid = syscall(SYS_gettid);
     nvtxNameOsThread(tid, "BackgroundCompile");
+    errs() << "KernelFunction: beginning background compilation.\n";
 
     // Extract our arguments
     struct compileModule_args* args = (struct compileModule_args*) v_args;
@@ -294,21 +305,101 @@ void *KernelFunction::compileModuleAsync_thread(void *v_args) {
     // Save the result
     args->cumodules->insert(make_pair(args->assumptions, cumodule));
     // We're done with the arguments
-    free(v_args);
+    delete v_args;
     return nullptr;
 }
 
-void KernelFunction::compileModuleAsync(const AssumptionList& assumptions, const llvm::Module* orig_module) {
+void KernelFunction::compileModuleAsync(AssumptionList assumptions) {
     // Create the arguments
-    struct compileModule_args* args = (struct compileModule_args*) malloc(sizeof(struct compileModule_args));
+    struct compileModule_args* args = new compileModule_args;
     args->assumptions = assumptions;
-    args->module = orig_module;
+    args->module = &getModule();
     args->cumodules = &cumodules;
     cuCtxGetCurrent(&args->ctx);
     pthread_t bg_thread;
     pthread_create(&bg_thread, NULL, KernelFunction::compileModuleAsync_thread, args);
 }
+void KernelFunction::proposeAssumptions(
+                        int gridX, int gridY, int gridZ,
+                        int blockX, int blockY, int blockZ,
+                        int smem, void** params) {
+    // Generate GeometryAssumptions
+    auto assumeGX = std::make_shared<GeometryAssumption>(GeometryAssumption::GridX, gridX);
+    auto assumeGY = std::make_shared<GeometryAssumption>(GeometryAssumption::GridY, gridY);
+    auto assumeGZ = std::make_shared<GeometryAssumption>(GeometryAssumption::GridZ, gridZ);
+    if(!hasAssumption(*assumeGX))
+      allAssumptions.push_back(assumeGX);
+    if(!hasAssumption(*assumeGY))
+      allAssumptions.push_back(assumeGY);
+    if(!hasAssumption(*assumeGZ))
+      allAssumptions.push_back(assumeGZ);
 
+    auto assumeBX = std::make_shared<GeometryAssumption>(GeometryAssumption::BlockX, blockX);
+    auto assumeBY = std::make_shared<GeometryAssumption>(GeometryAssumption::BlockY, blockY);
+    auto assumeBZ = std::make_shared<GeometryAssumption>(GeometryAssumption::BlockZ, blockZ);
+    if(!hasAssumption(*assumeBX))
+      allAssumptions.push_back(assumeBX);
+    if(!hasAssumption(*assumeBY))
+      allAssumptions.push_back(assumeBY);
+    if(!hasAssumption(*assumeBZ))
+      allAssumptions.push_back(assumeBZ);
+
+    // TODO: Generate additional assumptions
+    errs() << getKernelName() << ": Now has " << allAssumptions.size() << " possible assumptions.\n";
+}
+bool KernelFunction::hasAssumption(const Assumption& a) {
+    for(auto b=allAssumptions.begin(),e=allAssumptions.end(); b!=e; ++b) {
+      if(**b == a)
+          return true;
+    }
+    return false;
+}
+
+void KernelFunction::compileLikelyModule() {
+    // Collect the list of safe assumptions
+    AssumptionList likely;
+    for(auto a=allAssumptions.begin(),e=allAssumptions.end(); a!=e; ++a) {
+        if((*a)->willHold() >= Assumption::Likely)
+            likely.push_back(*a);
+    }
+    errs() << getKernelName() << ": " << likely.size() << " likely assumptions.\n";
+
+
+    if(!hasCompiledAssumptions(likely) && !compiling) {
+        // Let's build a new module!
+        errs() << getKernelName() << ": Recompiling.\n";
+        compileModuleAsync(likely);
+    } else {
+        errs() << getKernelName() << ": Likely assumptions match existing compilation.\n";
+    }
+}
+
+bool KernelFunction::hasCompiledAssumptions(const AssumptionList& candidate) const {
+    // Check if we have this particular list compiled
+    // (This is terribly inefficient)
+    bool exists = false;
+    for(auto t=cumodules.begin(),e=cumodules.end(); t!=e; ++t) {
+      if(t->first.size() == candidate.size()) {
+          // potential match, ensure all our elements are contained
+          bool elems_match = true;
+          for(auto l=candidate.begin(),e=candidate.end(); l!=e && elems_match; ++l) {
+            bool e_match = false;
+            for(auto existing=t->first.begin(),e=t->first.end();existing!=e && !e_match; ++existing) {
+              if(**l == **existing)
+                  e_match = true;
+            }
+            elems_match &= e_match;
+          }
+          if (elems_match) {
+            exists = true;
+            break;
+          }
+      }
+    }
+    return exists;
+}
+
+bool KernelFunction::compiling = false;
 bool KernelFunction::doneLLVMInit = false;
 bool KernelFunction::doneCUDAInit = false;
 llvm::LLVMContext KernelFunction::Context;

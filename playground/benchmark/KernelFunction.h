@@ -15,6 +15,7 @@ class KernelFunction {
   private:
     static bool doneLLVMInit;
     static bool doneCUDAInit;
+    static bool compiling;
     static llvm::PassRegistry* Registry;
     static llvm::LLVMContext Context;
     std::unique_ptr<llvm::Module> module;
@@ -40,5 +41,11 @@ class KernelFunction {
     static void LLVMInit();
     static void CUDAInit();
     static void *compileModuleAsync_thread(void *);
-    void compileModuleAsync(const AssumptionList&, const llvm::Module*);
+    void compileModuleAsync(AssumptionList);
+    void proposeAssumptions(int gridX, int gridY, int gridZ,
+                            int blockX, int blockY, int blockZ,
+                            int smem, void** params);
+    void compileLikelyModule();
+    bool hasAssumption(const Assumption& a);
+    bool hasCompiledAssumptions(const AssumptionList&) const;
 };
